@@ -19,7 +19,7 @@ st.markdown("""
 .block-container {
     padding-top: 1.2rem;
     padding-bottom: 2rem;
-    max-width: 1200px;
+    max-width: 1250px;
 }
 h1, h2, h3 {
     margin-bottom: 0.4rem;
@@ -90,7 +90,6 @@ STATUS_COLORS = {
     "afwezig": "🔴",
 }
 
-# Voor compatibiliteit met oudere data die nog Engelse waardes in de database kunnen hebben
 OLD_STATUS_MAP = {
     "present": "aanwezig",
     "late": "te_laat",
@@ -294,6 +293,19 @@ def add_session(team_id: int, title: str, session_date: str, start_time: str, se
         INSERT INTO sessions (team_id, title, session_date, start_time, session_type, notes)
         VALUES (?, ?, ?, ?, ?, ?)
     """, (team_id, title.strip(), session_date, start_time, session_type.strip(), notes.strip()))
+
+
+def update_session(session_id: int, title: str, session_date: str, start_time: str, session_type: str, notes: str):
+    run_query("""
+        UPDATE sessions
+        SET title = ?, session_date = ?, start_time = ?, session_type = ?, notes = ?
+        WHERE id = ?
+    """, (title.strip(), session_date, start_time, session_type.strip(), notes.strip(), session_id))
+
+
+def delete_session(session_id: int):
+    run_query("DELETE FROM attendance WHERE session_id = ?", (session_id,))
+    run_query("DELETE FROM sessions WHERE id = ?", (session_id,))
 
 
 def get_recent_session_for_team(team_id: int) -> Optional[pd.Series]:
@@ -506,16 +518,48 @@ def get_session_attendance_summary(team_id: int) -> pd.DataFrame:
     return grouped
 
 
+def get_player_session_type_stats(team_id: int, player_id: int) -> pd.DataFrame:
+    df = get_attendance_with_sessions(team_id)
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df[df["player_id"] == player_id].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["points"] = df["status"].map(STATUS_POINTS).fillna(0.0)
+
+    grouped = df.groupby("session_type", as_index=False).agg(
+        aanwezigheid_pct=("points", lambda x: round((x.sum() / len(x)) * 100, 1)),
+        sessies=("points", "count")
+    )
+    grouped = grouped.sort_values(["aanwezigheid_pct", "session_type"], ascending=[False, True])
+    return grouped
+
+
+def get_player_status_distribution(team_id: int, player_id: int, limit_sessions: int = 12) -> pd.DataFrame:
+    df = get_attendance_with_sessions(team_id)
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df[df["player_id"] == player_id].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["session_date"] = pd.to_datetime(df["session_date"])
+    df = df.sort_values("session_date", ascending=False).head(limit_sessions)
+    grouped = df.groupby("status", as_index=False).agg(aantal=("status", "count"))
+    grouped["status_label"] = grouped["status"].map(lambda x: STATUS_LABELS.get(x, x))
+    grouped = grouped.sort_values("aantal", ascending=False)
+    return grouped
+
+
 def build_signals(team_id: int) -> dict:
     stats_4w = calculate_player_stats(team_id=team_id, days=28)
     stats_3m = calculate_player_stats(team_id=team_id, days=90)
     all_att = get_attendance_with_sessions(team_id)
 
-    signals = {
-        "good": [],
-        "warn": [],
-        "bad": [],
-    }
+    signals = {"good": [], "warn": [], "bad": []}
 
     if not stats_4w.empty:
         top = stats_4w.head(3)
@@ -562,6 +606,53 @@ def build_signals(team_id: int) -> dict:
             if present_streak >= 4:
                 signals["good"].append(f"{player_name} is al {present_streak} sessies op rij volledig aanwezig.")
 
+    return signals
+
+
+def build_player_signals(team_id: int, player_id: int, player_name: str) -> list[str]:
+    signals = []
+
+    stats_4w = calculate_player_stats(team_id, days=28)
+    stats_3m = calculate_player_stats(team_id, days=90)
+    hist = get_player_history(player_id)
+
+    pct4 = pct_or_zero(stats_4w, player_id)
+    pct3 = pct_or_zero(stats_3m, player_id)
+
+    if pct4 >= 90 and safe_sessions_count(stats_4w, player_id) >= 3:
+        signals.append(f"{player_name} heeft een sterke aanwezigheid in de laatste 4 weken ({pct4}%).")
+    elif 0 < pct4 < 60:
+        signals.append(f"{player_name} vraagt aandacht in de laatste 4 weken ({pct4}%).")
+
+    if pct3 >= 85 and safe_sessions_count(stats_3m, player_id) >= 5:
+        signals.append(f"{player_name} is structureel sterk aanwezig over de laatste 3 maanden ({pct3}%).")
+    elif 0 < pct3 < 60:
+        signals.append(f"{player_name} zit ook over 3 maanden onder de gewenste norm ({pct3}%).")
+
+    if not hist.empty:
+        hist = hist.copy()
+        hist["session_date"] = pd.to_datetime(hist["session_date"])
+
+        present_streak = 0
+        for _, row in hist.iterrows():
+            if row["status"] == "aanwezig":
+                present_streak += 1
+            else:
+                break
+        if present_streak >= 4:
+            signals.append(f"{player_name} is {present_streak} sessies op rij volledig aanwezig.")
+
+        absent_streak = 0
+        for _, row in hist.iterrows():
+            if row["status"] in ["afwezig", "afgemeld", "geblesseerd"]:
+                absent_streak += 1
+            else:
+                break
+        if absent_streak >= 2:
+            signals.append(f"{player_name} heeft {absent_streak} sessies op rij gemist.")
+
+    if not signals:
+        signals.append(f"Nog geen opvallende analyse voor {player_name}.")
     return signals
 
 
@@ -619,9 +710,9 @@ def page_dashboard():
 
     players_df = get_players(team_id)
     sessions_df = get_sessions(team_id)
-    stats_all = calculate_player_stats(team_id)
     stats_4w = calculate_player_stats(team_id, days=28)
     stats_3m = calculate_player_stats(team_id, days=90)
+    stats_all = calculate_player_stats(team_id)
     latest_session = get_recent_session_for_team(team_id)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -654,7 +745,6 @@ def page_dashboard():
     with col2:
         st.subheader("Belangrijkste signalen")
         signals = build_signals(team_id)
-
         if not any(signals.values()):
             st.info("Nog geen signalen.")
         else:
@@ -678,8 +768,7 @@ def page_dashboard():
             if monthly_team.empty:
                 st.info("Nog geen data.")
             else:
-                chart_df = monthly_team.set_index("month")[["attendance_pct"]]
-                st.bar_chart(chart_df)
+                st.bar_chart(monthly_team.set_index("month")[["attendance_pct"]])
 
         with chart_col2:
             st.markdown("**Aanwezigheid per sessie**")
@@ -687,8 +776,7 @@ def page_dashboard():
             if session_summary.empty:
                 st.info("Nog geen data.")
             else:
-                chart_df = session_summary.tail(20).set_index("session_date")[["attendance_pct"]]
-                st.line_chart(chart_df)
+                st.line_chart(session_summary.tail(20).set_index("session_date")[["attendance_pct"]])
 
     with tab2:
         left, right = st.columns(2)
@@ -818,31 +906,85 @@ def page_sessions():
     team_name = st.selectbox("Kies team", list(team_options.keys()))
     team_id = team_options[team_name]
 
-    with st.form("session_form"):
-        title = st.text_input("Titel", placeholder="Bijv. Training dinsdag")
-        session_date = st.date_input("Datum", value=date.today())
-        start_time = st.text_input("Starttijd", placeholder="18:30")
-        session_type = st.selectbox("Type", ["training", "wedstrijd", "teammeeting", "activiteit"])
-        notes = st.text_area("Notities")
-        submitted = st.form_submit_button("Sessie toevoegen")
+    tab1, tab2 = st.tabs(["Nieuwe sessie", "Sessie bewerken"])
 
-        if submitted:
-            if not title.strip():
-                st.error("Vul een titel in.")
-            else:
-                add_session(
-                    team_id,
-                    title,
-                    session_date.strftime("%Y-%m-%d"),
-                    start_time,
-                    session_type,
-                    notes,
-                )
-                st.success("Sessie toegevoegd.")
-                st.rerun()
+    with tab1:
+        with st.form("session_form"):
+            title = st.text_input("Titel", placeholder="Bijv. Training dinsdag")
+            session_date = st.date_input("Datum", value=date.today())
+            start_time = st.text_input("Starttijd", placeholder="18:30")
+            session_type = st.selectbox("Type", ["training", "wedstrijd", "teammeeting", "activiteit"])
+            notes = st.text_area("Notities")
+            submitted = st.form_submit_button("Sessie toevoegen")
+
+            if submitted:
+                if not title.strip():
+                    st.error("Vul een titel in.")
+                else:
+                    add_session(
+                        team_id,
+                        title,
+                        session_date.strftime("%Y-%m-%d"),
+                        start_time,
+                        session_type,
+                        notes,
+                    )
+                    st.success("Sessie toegevoegd.")
+                    st.rerun()
+
+    with tab2:
+        sessions_df = get_sessions(team_id)
+        if sessions_df.empty:
+            st.info("Nog geen sessies om te bewerken.")
+        else:
+            session_map = {
+                f"{row['session_date']} - {row['title']} ({row['session_type']})": int(row["id"])
+                for _, row in sessions_df.iterrows()
+            }
+            chosen_label = st.selectbox("Kies sessie", list(session_map.keys()))
+            chosen_id = session_map[chosen_label]
+
+            current = sessions_df[sessions_df["id"] == chosen_id].iloc[0]
+
+            with st.form("edit_session_form"):
+                new_title = st.text_input("Titel", value=current["title"])
+                current_date = pd.to_datetime(current["session_date"]).date()
+                new_date = st.date_input("Datum", value=current_date)
+                new_time = st.text_input("Starttijd", value=current["start_time"] if pd.notna(current["start_time"]) else "")
+                type_options = ["training", "wedstrijd", "teammeeting", "activiteit"]
+                default_type_index = type_options.index(current["session_type"]) if current["session_type"] in type_options else 0
+                new_type = st.selectbox("Type", type_options, index=default_type_index)
+                new_notes = st.text_area("Notities", value=current["notes"] if pd.notna(current["notes"]) else "")
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    save = st.form_submit_button("Sessie opslaan", use_container_width=True)
+                with c2:
+                    delete = st.form_submit_button("Sessie verwijderen", use_container_width=True)
+
+                if save:
+                    if not new_title.strip():
+                        st.error("Vul een titel in.")
+                    else:
+                        update_session(
+                            chosen_id,
+                            new_title,
+                            new_date.strftime("%Y-%m-%d"),
+                            new_time,
+                            new_type,
+                            new_notes,
+                        )
+                        st.success("Sessie bijgewerkt.")
+                        st.rerun()
+
+                if delete:
+                    delete_session(chosen_id)
+                    st.success("Sessie verwijderd.")
+                    st.rerun()
 
     st.divider()
 
+    st.subheader("Bestaande sessies")
     sessions_df = get_sessions(team_id)
     if sessions_df.empty:
         st.info("Nog geen sessies.")
@@ -946,11 +1088,7 @@ def page_attendance():
             "player_id": st.column_config.NumberColumn("ID", disabled=True),
             "Speler": st.column_config.TextColumn("Speler", disabled=True),
             "Rol": st.column_config.TextColumn("Rol", disabled=True),
-            "Status": st.column_config.SelectboxColumn(
-                "Status",
-                options=STATUS_OPTIONS,
-                required=True,
-            ),
+            "Status": st.column_config.SelectboxColumn("Status", options=STATUS_OPTIONS, required=True),
             "Reden": st.column_config.TextColumn("Reden"),
             "Notitie": st.column_config.TextColumn("Notitie"),
         },
@@ -985,16 +1123,14 @@ def page_attendance():
         st.info("Nog geen opgeslagen aanwezigheid voor deze sessie.")
     else:
         current_df = current_df.copy()
-        current_df["Status zichtbaar"] = current_df["status"].map(
-            lambda x: f"{STATUS_COLORS.get(x, '')} {STATUS_LABELS.get(x, x)}"
-        )
+        current_df["Status zichtbaar"] = current_df["status"].map(lambda x: f"{STATUS_COLORS.get(x, '')} {STATUS_LABELS.get(x, x)}")
         show_df = current_df[["player_name", "Status zichtbaar", "reason", "note"]].copy()
         show_df.columns = ["Speler", "Status", "Reden", "Notitie"]
         st.dataframe(show_df, use_container_width=True, hide_index=True)
 
 
 def page_player_overview():
-    st.title("📊 Spelersoverzicht")
+    st.title("📊 Spelersoverzicht & analyse")
 
     teams = get_teams()
     if teams.empty:
@@ -1041,20 +1177,67 @@ def page_player_overview():
     c2.metric("Laatste 4 weken", f"{pct_or_zero(stats_4w, player_id)}%")
     c3.metric("Laatste 3 maanden", f"{pct_or_zero(stats_3m, player_id)}%")
 
-    monthly_player = get_monthly_player_attendance(team_id, player_id)
-    if not monthly_player.empty:
-        st.markdown("**Maandgrafiek speler**")
-        st.bar_chart(monthly_player.set_index("month")[["attendance_pct"]])
+    st.divider()
 
-    history_df = get_player_history(player_id)
-    if history_df.empty:
-        st.info("Nog geen historie.")
-    else:
-        history_df["Status"] = history_df["status"].map(lambda x: f"{STATUS_COLORS.get(x, '')} {STATUS_LABELS.get(x, x)}")
-        history_df["session_date"] = history_df["session_date"].apply(fmt_date)
-        show_history = history_df[["session_date", "title", "session_type", "Status", "reason", "note"]].copy()
-        show_history.columns = ["Datum", "Sessie", "Type", "Status", "Reden", "Notitie"]
-        st.dataframe(show_history, use_container_width=True, hide_index=True)
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Trend",
+        "Per type sessie",
+        "Statusverdeling",
+        "Historie & signalen"
+    ])
+
+    with tab1:
+        monthly_player = get_monthly_player_attendance(team_id, player_id)
+        if monthly_player.empty:
+            st.info("Nog geen data voor deze speler.")
+        else:
+            st.markdown("**Maandtrend aanwezigheid**")
+            st.bar_chart(monthly_player.set_index("month")[["attendance_pct"]])
+
+            trend_df = monthly_player.copy()
+            trend_df.columns = ["Maand", "Aanwezigheid %", "Sessies"]
+            st.dataframe(trend_df, use_container_width=True, hide_index=True)
+
+    with tab2:
+        type_df = get_player_session_type_stats(team_id, player_id)
+        if type_df.empty:
+            st.info("Nog geen sessietypes om te analyseren.")
+        else:
+            st.markdown("**Aanwezigheid per type sessie**")
+            chart_df = type_df.set_index("session_type")[["aanwezigheid_pct"]]
+            st.bar_chart(chart_df)
+
+            show_type_df = type_df.copy()
+            show_type_df.columns = ["Type sessie", "Aanwezigheid %", "Sessies"]
+            st.dataframe(show_type_df, use_container_width=True, hide_index=True)
+
+    with tab3:
+        dist_df = get_player_status_distribution(team_id, player_id, limit_sessions=12)
+        if dist_df.empty:
+            st.info("Nog geen recente statusdata.")
+        else:
+            st.markdown("**Statusverdeling laatste 12 sessies**")
+            chart_df = dist_df.set_index("status_label")[["aantal"]]
+            st.bar_chart(chart_df)
+
+            show_dist_df = dist_df[["status_label", "aantal"]].copy()
+            show_dist_df.columns = ["Status", "Aantal"]
+            st.dataframe(show_dist_df, use_container_width=True, hide_index=True)
+
+    with tab4:
+        st.markdown("**Automatische analyse**")
+        for s in build_player_signals(team_id, player_id, selected_player_name):
+            st.write(f"- {s}")
+
+        history_df = get_player_history(player_id)
+        if history_df.empty:
+            st.info("Nog geen historie.")
+        else:
+            history_df["Status"] = history_df["status"].map(lambda x: f"{STATUS_COLORS.get(x, '')} {STATUS_LABELS.get(x, x)}")
+            history_df["session_date"] = history_df["session_date"].apply(fmt_date)
+            show_history = history_df[["session_date", "title", "session_type", "Status", "reason", "note"]].copy()
+            show_history.columns = ["Datum", "Sessie", "Type", "Status", "Reden", "Notitie"]
+            st.dataframe(show_history, use_container_width=True, hide_index=True)
 
 
 def page_staff_view():
@@ -1091,11 +1274,7 @@ def page_staff_view():
     ]].copy()
 
     export_df["status"] = export_df["status"].map(lambda x: STATUS_LABELS.get(x, x))
-
-    export_df.columns = [
-        "Team", "Datum", "Sessie", "Type",
-        "Speler", "Status", "Reden", "Notitie"
-    ]
+    export_df.columns = ["Team", "Datum", "Sessie", "Type", "Speler", "Status", "Reden", "Notitie"]
 
     st.markdown("**Volledige export**")
     st.dataframe(export_df, use_container_width=True, hide_index=True)
