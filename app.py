@@ -1,3 +1,6 @@
+import hashlib
+import os
+import secrets
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime
@@ -9,7 +12,7 @@ import streamlit as st
 DB_NAME = "attendance_app.db"
 
 st.set_page_config(
-    page_title="Team Attendance Pro",
+    page_title="Aanwezigheidsapp Team",
     page_icon="🏑",
     layout="wide",
 )
@@ -43,6 +46,21 @@ h1, h2, h3 {
     border-radius: 12px;
     background: rgba(239,68,68,0.12);
     border: 1px solid rgba(239,68,68,0.35);
+    margin-bottom: 8px;
+}
+.login-box {
+    max-width: 520px;
+    margin: 0 auto;
+    padding: 20px;
+    border-radius: 16px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.03);
+}
+.info-box {
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(59,130,246,0.25);
+    background: rgba(59,130,246,0.10);
     margin-bottom: 8px;
 }
 @media (max-width: 768px) {
@@ -125,6 +143,18 @@ def init_db():
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            full_name TEXT NOT NULL,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (team_id) REFERENCES teams(id)
+        )
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS players (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -180,6 +210,40 @@ def migrate_old_statuses():
         conn.commit()
 
 
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    hashed = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt.encode("utf-8"),
+        n=16384,
+        r=8,
+        p=1
+    )
+    return f"{salt}${hashed.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt, hashed_hex = stored_hash.split("$", 1)
+        new_hash = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt.encode("utf-8"),
+            n=16384,
+            r=8,
+            p=1
+        ).hex()
+        return secrets.compare_digest(new_hash, hashed_hex)
+    except Exception:
+        return False
+
+
+def count_users() -> int:
+    with closing(get_connection()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        return int(cur.fetchone()[0])
+
+
 def fmt_date(d: str) -> str:
     try:
         return datetime.strptime(d, "%Y-%m-%d").strftime("%d-%m-%Y")
@@ -223,39 +287,108 @@ def safe_sessions_count(df: pd.DataFrame, player_id: int) -> int:
     return int(part["sessions_count"].iloc[0])
 
 
-def get_teams() -> pd.DataFrame:
-    return run_query_df("""
-        SELECT id, name, age_group, season
-        FROM teams
-        ORDER BY name
-    """)
+# -----------------------------
+# AUTH
+# -----------------------------
+def get_user_by_username(username: str) -> Optional[dict]:
+    with closing(get_connection()) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT u.id, u.team_id, u.full_name, u.username, u.password_hash, t.name
+            FROM users u
+            JOIN teams t ON u.team_id = t.id
+            WHERE LOWER(u.username) = LOWER(?)
+        """, (username.strip(),))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "team_id": row[1],
+            "full_name": row[2],
+            "username": row[3],
+            "password_hash": row[4],
+            "team_name": row[5],
+        }
 
 
-def add_team(name: str, age_group: str, season: str):
+def create_team_and_user(team_name: str, age_group: str, season: str, full_name: str, username: str, password: str):
+    with closing(get_connection()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            "INSERT INTO teams (name, age_group, season) VALUES (?, ?, ?)",
+            (team_name.strip(), age_group.strip(), season.strip())
+        )
+        team_id = cur.lastrowid
+
+        cur.execute(
+            "INSERT INTO users (team_id, full_name, username, password_hash) VALUES (?, ?, ?, ?)",
+            (team_id, full_name.strip(), username.strip(), hash_password(password))
+        )
+        conn.commit()
+
+
+def create_extra_user_for_team(team_id: int, full_name: str, username: str, password: str):
     run_query(
-        "INSERT INTO teams (name, age_group, season) VALUES (?, ?, ?)",
-        (name.strip(), age_group.strip(), season.strip())
+        "INSERT INTO users (team_id, full_name, username, password_hash) VALUES (?, ?, ?, ?)",
+        (team_id, full_name.strip(), username.strip(), hash_password(password))
     )
 
 
-def get_players(team_id: Optional[int] = None, active_only: bool = True) -> pd.DataFrame:
-    query = """
-        SELECT p.id, p.name, p.jersey_number, p.role, p.team_id, p.active, t.name AS team_name
-        FROM players p
-        LEFT JOIN teams t ON p.team_id = t.id
-        WHERE 1=1
-    """
-    params = []
+def update_current_user_password(user_id: int, new_password: str):
+    run_query(
+        "UPDATE users SET password_hash = ? WHERE id = ?",
+        (hash_password(new_password), user_id)
+    )
 
-    if team_id is not None:
-        query += " AND p.team_id = ?"
-        params.append(team_id)
+
+def login(username: str, password: str) -> bool:
+    user = get_user_by_username(username)
+    if not user:
+        return False
+
+    if not verify_password(password, user["password_hash"]):
+        return False
+
+    st.session_state["logged_in"] = True
+    st.session_state["user_id"] = user["id"]
+    st.session_state["team_id"] = user["team_id"]
+    st.session_state["team_name"] = user["team_name"]
+    st.session_state["full_name"] = user["full_name"]
+    st.session_state["username"] = user["username"]
+    return True
+
+
+def logout():
+    for key in ["logged_in", "user_id", "team_id", "team_name", "full_name", "username"]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def require_login():
+    return st.session_state.get("logged_in", False)
+
+
+# -----------------------------
+# DATA
+# -----------------------------
+def get_team(team_id: int) -> pd.DataFrame:
+    return run_query_df("SELECT * FROM teams WHERE id = ?", (team_id,))
+
+
+def get_players(team_id: int, active_only: bool = True) -> pd.DataFrame:
+    query = """
+        SELECT p.id, p.name, p.jersey_number, p.role, p.team_id, p.active
+        FROM players p
+        WHERE p.team_id = ?
+    """
+    params = [team_id]
 
     if active_only:
         query += " AND p.active = 1"
 
     query += " ORDER BY p.name"
-
     return run_query_df(query, tuple(params))
 
 
@@ -266,26 +399,17 @@ def add_player(name: str, jersey_number: str, role: str, team_id: int):
     """, (name.strip(), jersey_number.strip(), role.strip(), team_id))
 
 
-def deactivate_player(player_id: int):
-    run_query("UPDATE players SET active = 0 WHERE id = ?", (player_id,))
+def deactivate_player(player_id: int, team_id: int):
+    run_query("UPDATE players SET active = 0 WHERE id = ? AND team_id = ?", (player_id, team_id))
 
 
-def get_sessions(team_id: Optional[int] = None) -> pd.DataFrame:
-    query = """
-        SELECT s.id, s.title, s.session_date, s.start_time, s.session_type, s.notes, s.team_id, t.name AS team_name
-        FROM sessions s
-        JOIN teams t ON s.team_id = t.id
-        WHERE 1=1
-    """
-    params = []
-
-    if team_id is not None:
-        query += " AND s.team_id = ?"
-        params.append(team_id)
-
-    query += " ORDER BY s.session_date DESC, s.start_time DESC"
-
-    return run_query_df(query, tuple(params))
+def get_sessions(team_id: int) -> pd.DataFrame:
+    return run_query_df("""
+        SELECT id, title, session_date, start_time, session_type, notes, team_id
+        FROM sessions
+        WHERE team_id = ?
+        ORDER BY session_date DESC, start_time DESC
+    """, (team_id,))
 
 
 def add_session(team_id: int, title: str, session_date: str, start_time: str, session_type: str, notes: str):
@@ -295,17 +419,20 @@ def add_session(team_id: int, title: str, session_date: str, start_time: str, se
     """, (team_id, title.strip(), session_date, start_time, session_type.strip(), notes.strip()))
 
 
-def update_session(session_id: int, title: str, session_date: str, start_time: str, session_type: str, notes: str):
+def update_session(session_id: int, team_id: int, title: str, session_date: str, start_time: str, session_type: str, notes: str):
     run_query("""
         UPDATE sessions
         SET title = ?, session_date = ?, start_time = ?, session_type = ?, notes = ?
-        WHERE id = ?
-    """, (title.strip(), session_date, start_time, session_type.strip(), notes.strip(), session_id))
+        WHERE id = ? AND team_id = ?
+    """, (title.strip(), session_date, start_time, session_type.strip(), notes.strip(), session_id, team_id))
 
 
-def delete_session(session_id: int):
+def delete_session(session_id: int, team_id: int):
+    session_df = run_query_df("SELECT id FROM sessions WHERE id = ? AND team_id = ?", (session_id, team_id))
+    if session_df.empty:
+        return
     run_query("DELETE FROM attendance WHERE session_id = ?", (session_id,))
-    run_query("DELETE FROM sessions WHERE id = ?", (session_id,))
+    run_query("DELETE FROM sessions WHERE id = ? AND team_id = ?", (session_id, team_id))
 
 
 def get_recent_session_for_team(team_id: int) -> Optional[pd.Series]:
@@ -323,7 +450,6 @@ def get_recent_session_for_team(team_id: int) -> Optional[pd.Series]:
 
 def upsert_attendance(session_id: int, player_id: int, status: str, reason: str = "", note: str = ""):
     status = normalize_status(status)
-
     run_query("""
         INSERT INTO attendance (session_id, player_id, status, reason, note)
         VALUES (?, ?, ?, ?, ?)
@@ -336,12 +462,11 @@ def upsert_attendance(session_id: int, player_id: int, status: str, reason: str 
 
 
 def bulk_set_status_for_session(session_id: int, player_ids: list[int], status: str):
-    status = normalize_status(status)
     for pid in player_ids:
         upsert_attendance(session_id, pid, status, "", "")
 
 
-def get_attendance_for_session(session_id: int) -> pd.DataFrame:
+def get_attendance_for_session(session_id: int, team_id: int) -> pd.DataFrame:
     df = run_query_df("""
         SELECT
             a.id,
@@ -355,18 +480,18 @@ def get_attendance_for_session(session_id: int) -> pd.DataFrame:
             a.note
         FROM attendance a
         JOIN players p ON a.player_id = p.id
-        WHERE a.session_id = ?
+        JOIN sessions s ON a.session_id = s.id
+        WHERE a.session_id = ? AND s.team_id = ?
         ORDER BY p.name
-    """, (session_id,))
+    """, (session_id, team_id))
 
     if not df.empty:
         df["status"] = df["status"].apply(normalize_status)
-
     return df
 
 
-def get_attendance_with_sessions(team_id: Optional[int] = None) -> pd.DataFrame:
-    query = """
+def get_attendance_with_sessions(team_id: int) -> pd.DataFrame:
+    df = run_query_df("""
         SELECT
             a.id,
             a.session_id,
@@ -377,34 +502,22 @@ def get_attendance_with_sessions(team_id: Optional[int] = None) -> pd.DataFrame:
             p.name AS player_name,
             p.jersey_number,
             p.role,
-            p.team_id,
             s.title,
             s.session_date,
-            s.session_type,
-            t.name AS team_name
+            s.session_type
         FROM attendance a
         JOIN players p ON a.player_id = p.id
         JOIN sessions s ON a.session_id = s.id
-        JOIN teams t ON s.team_id = t.id
-        WHERE 1=1
-    """
-    params = []
-
-    if team_id is not None:
-        query += " AND s.team_id = ?"
-        params.append(team_id)
-
-    query += " ORDER BY s.session_date DESC"
-
-    df = run_query_df(query, tuple(params))
+        WHERE s.team_id = ?
+        ORDER BY s.session_date DESC
+    """, (team_id,))
 
     if not df.empty:
         df["status"] = df["status"].apply(normalize_status)
-
     return df
 
 
-def get_player_history(player_id: int) -> pd.DataFrame:
+def get_player_history(player_id: int, team_id: int) -> pd.DataFrame:
     df = run_query_df("""
         SELECT
             s.session_date,
@@ -412,22 +525,23 @@ def get_player_history(player_id: int) -> pd.DataFrame:
             s.session_type,
             a.status,
             a.reason,
-            a.note,
-            t.name AS team_name
+            a.note
         FROM attendance a
         JOIN sessions s ON a.session_id = s.id
-        JOIN teams t ON s.team_id = t.id
-        WHERE a.player_id = ?
+        JOIN players p ON a.player_id = p.id
+        WHERE a.player_id = ? AND p.team_id = ?
         ORDER BY s.session_date DESC
-    """, (player_id,))
+    """, (player_id, team_id))
 
     if not df.empty:
         df["status"] = df["status"].apply(normalize_status)
-
     return df
 
 
-def calculate_player_stats(team_id: Optional[int] = None, days: Optional[int] = None) -> pd.DataFrame:
+# -----------------------------
+# ANALYSE
+# -----------------------------
+def calculate_player_stats(team_id: int, days: Optional[int] = None) -> pd.DataFrame:
     df = get_attendance_with_sessions(team_id)
 
     if df.empty:
@@ -528,7 +642,6 @@ def get_player_session_type_stats(team_id: int, player_id: int) -> pd.DataFrame:
         return pd.DataFrame()
 
     df["points"] = df["status"].map(STATUS_POINTS).fillna(0.0)
-
     grouped = df.groupby("session_type", as_index=False).agg(
         aanwezigheid_pct=("points", lambda x: round((x.sum() / len(x)) * 100, 1)),
         sessies=("points", "count")
@@ -555,32 +668,25 @@ def get_player_status_distribution(team_id: int, player_id: int, limit_sessions:
 
 
 def build_signals(team_id: int) -> dict:
-    stats_4w = calculate_player_stats(team_id=team_id, days=28)
-    stats_3m = calculate_player_stats(team_id=team_id, days=90)
+    stats_4w = calculate_player_stats(team_id, days=28)
+    stats_3m = calculate_player_stats(team_id, days=90)
     all_att = get_attendance_with_sessions(team_id)
 
     signals = {"good": [], "warn": [], "bad": []}
 
     if not stats_4w.empty:
-        top = stats_4w.head(3)
-        for _, row in top.iterrows():
+        for _, row in stats_4w.head(3).iterrows():
             if row["sessions_count"] >= 2:
-                signals["good"].append(
-                    f"{row['player_name']} zit op {row['attendance_pct']}% in de laatste 4 weken."
-                )
+                signals["good"].append(f"{row['player_name']} zit op {row['attendance_pct']}% in de laatste 4 weken.")
 
         low = stats_4w[stats_4w["attendance_pct"] < 60].head(5)
         for _, row in low.iterrows():
-            signals["bad"].append(
-                f"{row['player_name']} zit op slechts {row['attendance_pct']}% in de laatste 4 weken."
-            )
+            signals["bad"].append(f"{row['player_name']} zit op slechts {row['attendance_pct']}% in de laatste 4 weken.")
 
     if not stats_3m.empty:
         shaky = stats_3m[(stats_3m["attendance_pct"] >= 60) & (stats_3m["attendance_pct"] < 80)].head(5)
         for _, row in shaky.iterrows():
-            signals["warn"].append(
-                f"{row['player_name']} zit op {row['attendance_pct']}% in de laatste 3 maanden."
-            )
+            signals["warn"].append(f"{row['player_name']} zit op {row['attendance_pct']}% in de laatste 3 maanden.")
 
     if not all_att.empty:
         all_att["session_date"] = pd.to_datetime(all_att["session_date"])
@@ -611,10 +717,9 @@ def build_signals(team_id: int) -> dict:
 
 def build_player_signals(team_id: int, player_id: int, player_name: str) -> list[str]:
     signals = []
-
     stats_4w = calculate_player_stats(team_id, days=28)
     stats_3m = calculate_player_stats(team_id, days=90)
-    hist = get_player_history(player_id)
+    hist = get_player_history(player_id, team_id)
 
     pct4 = pct_or_zero(stats_4w, player_id)
     pct3 = pct_or_zero(stats_3m, player_id)
@@ -661,13 +766,11 @@ def build_shareable_summary(team_name: str, team_id: int) -> str:
     stats_3m = calculate_player_stats(team_id, days=90)
     latest = get_recent_session_for_team(team_id)
 
-    lines = []
-    lines.append(f"Teamoverzicht {team_name}")
-    lines.append("")
+    lines = [f"Teamoverzicht {team_name}", ""]
 
     if latest is not None:
         lines.append(f"Laatste sessie: {latest['title']} op {fmt_date(latest['session_date'])} ({latest['session_type']})")
-        att = get_attendance_for_session(int(latest["id"]))
+        att = get_attendance_for_session(int(latest["id"]), team_id)
         if not att.empty:
             counts = att["status"].value_counts().to_dict()
             lines.append(
@@ -696,17 +799,66 @@ def build_shareable_summary(team_name: str, team_id: int) -> str:
     return "\n".join(lines)
 
 
-def page_dashboard():
-    st.title("🏑 Dashboard Pro")
+# -----------------------------
+# PAGINA'S LOGIN
+# -----------------------------
+def page_first_setup():
+    st.title("🔐 Eerste keer instellen")
+    st.markdown("<div class='login-box'>", unsafe_allow_html=True)
+    st.write("Maak hieronder het eerste teamaccount aan.")
 
-    teams = get_teams()
-    if teams.empty:
-        st.info("Voeg eerst een team toe bij 'Teams beheren'.")
-        return
+    with st.form("first_setup_form"):
+        team_name = st.text_input("Teamnaam", placeholder="Bijv. O16-1")
+        age_group = st.text_input("Leeftijdsgroep", placeholder="Bijv. O16")
+        season = st.text_input("Seizoen", placeholder="Bijv. 2025-2026")
+        full_name = st.text_input("Jouw naam", placeholder="Bijv. Pepijn")
+        username = st.text_input("Gebruikersnaam", placeholder="Bijv. o16coach")
+        password = st.text_input("Wachtwoord", type="password")
+        password_repeat = st.text_input("Herhaal wachtwoord", type="password")
+        submitted = st.form_submit_button("Account aanmaken")
 
-    team_options = {row["name"]: int(row["id"]) for _, row in teams.iterrows()}
-    selected_team_name = st.selectbox("Kies team", list(team_options.keys()))
-    team_id = team_options[selected_team_name]
+        if submitted:
+            if not team_name.strip() or not full_name.strip() or not username.strip() or not password.strip():
+                st.error("Vul alle verplichte velden in.")
+            elif password != password_repeat:
+                st.error("De wachtwoorden zijn niet gelijk.")
+            elif len(password) < 6:
+                st.error("Kies een wachtwoord van minimaal 6 tekens.")
+            else:
+                try:
+                    create_team_and_user(team_name, age_group, season, full_name, username, password)
+                    st.success("Teamaccount aangemaakt. Log nu in.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Deze teamnaam of gebruikersnaam bestaat al.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def page_login():
+    st.title("🏑 Inloggen")
+    st.markdown("<div class='login-box'>", unsafe_allow_html=True)
+
+    with st.form("login_form"):
+        username = st.text_input("Gebruikersnaam")
+        password = st.text_input("Wachtwoord", type="password")
+        submitted = st.form_submit_button("Inloggen")
+
+        if submitted:
+            if login(username, password):
+                st.success("Succesvol ingelogd.")
+                st.rerun()
+            else:
+                st.error("Onjuiste gebruikersnaam of wachtwoord.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# -----------------------------
+# PAGINA'S APP
+# -----------------------------
+def page_dashboard(team_id: int, team_name: str):
+    st.title(f"🏑 Dashboard — {team_name}")
 
     players_df = get_players(team_id)
     sessions_df = get_sessions(team_id)
@@ -732,7 +884,7 @@ def page_dashboard():
         else:
             st.write(f"**{latest_session['title']}**")
             st.write(f"{fmt_date(latest_session['session_date'])} · {latest_session['session_type']}")
-            att = get_attendance_for_session(int(latest_session["id"]))
+            att = get_attendance_for_session(int(latest_session["id"]), team_id)
             if att.empty:
                 st.info("Nog geen aanwezigheid ingevuld.")
             else:
@@ -760,9 +912,9 @@ def page_dashboard():
     tab1, tab2, tab3 = st.tabs(["📊 Grafieken", "🏅 Top / aandacht", "📋 Overzicht"])
 
     with tab1:
-        chart_col1, chart_col2 = st.columns(2)
+        col_a, col_b = st.columns(2)
 
-        with chart_col1:
+        with col_a:
             st.markdown("**Teamaanwezigheid per maand**")
             monthly_team = get_monthly_team_attendance(team_id)
             if monthly_team.empty:
@@ -770,7 +922,7 @@ def page_dashboard():
             else:
                 st.bar_chart(monthly_team.set_index("month")[["attendance_pct"]])
 
-        with chart_col2:
+        with col_b:
             st.markdown("**Aanwezigheid per sessie**")
             session_summary = get_session_attendance_summary(team_id)
             if session_summary.empty:
@@ -821,45 +973,8 @@ def page_dashboard():
             st.dataframe(overview_df, use_container_width=True, hide_index=True)
 
 
-def page_manage_teams():
-    st.title("👥 Teams beheren")
-
-    with st.form("team_form"):
-        name = st.text_input("Teamnaam", placeholder="Bijv. O16-1")
-        age_group = st.text_input("Leeftijdsgroep", placeholder="Bijv. O16")
-        season = st.text_input("Seizoen", placeholder="Bijv. 2025-2026")
-        submitted = st.form_submit_button("Team toevoegen")
-
-        if submitted:
-            if not name.strip():
-                st.error("Vul een teamnaam in.")
-            else:
-                try:
-                    add_team(name, age_group, season)
-                    st.success("Team toegevoegd.")
-                    st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("Dit team bestaat al.")
-
-    st.divider()
-    teams = get_teams()
-    if teams.empty:
-        st.info("Nog geen teams.")
-    else:
-        st.dataframe(teams, use_container_width=True, hide_index=True)
-
-
-def page_manage_players():
+def page_manage_players(team_id: int):
     st.title("🏃 Spelers beheren")
-
-    teams = get_teams()
-    if teams.empty:
-        st.info("Voeg eerst een team toe.")
-        return
-
-    team_options = {row["name"]: int(row["id"]) for _, row in teams.iterrows()}
-    team_name = st.selectbox("Kies team", list(team_options.keys()))
-    team_id = team_options[team_name]
 
     with st.form("player_form"):
         name = st.text_input("Naam speler")
@@ -889,22 +1004,13 @@ def page_manage_players():
         if player_map:
             selected = st.selectbox("Speler deactiveren", list(player_map.keys()))
             if st.button("Deactiveer speler"):
-                deactivate_player(player_map[selected])
+                deactivate_player(player_map[selected], team_id)
                 st.success("Speler gedeactiveerd.")
                 st.rerun()
 
 
-def page_sessions():
+def page_sessions(team_id: int):
     st.title("📅 Sessies")
-
-    teams = get_teams()
-    if teams.empty:
-        st.info("Voeg eerst een team toe.")
-        return
-
-    team_options = {row["name"]: int(row["id"]) for _, row in teams.iterrows()}
-    team_name = st.selectbox("Kies team", list(team_options.keys()))
-    team_id = team_options[team_name]
 
     tab1, tab2 = st.tabs(["Nieuwe sessie", "Sessie bewerken"])
 
@@ -968,6 +1074,7 @@ def page_sessions():
                     else:
                         update_session(
                             chosen_id,
+                            team_id,
                             new_title,
                             new_date.strftime("%Y-%m-%d"),
                             new_time,
@@ -978,7 +1085,7 @@ def page_sessions():
                         st.rerun()
 
                 if delete:
-                    delete_session(chosen_id)
+                    delete_session(chosen_id, team_id)
                     st.success("Sessie verwijderd.")
                     st.rerun()
 
@@ -994,17 +1101,8 @@ def page_sessions():
         st.dataframe(show_df, use_container_width=True, hide_index=True)
 
 
-def page_attendance():
+def page_attendance(team_id: int):
     st.title("✅ Snelle aanwezigheid invoeren")
-
-    teams = get_teams()
-    if teams.empty:
-        st.info("Voeg eerst een team toe.")
-        return
-
-    team_options = {row["name"]: int(row["id"]) for _, row in teams.iterrows()}
-    team_name = st.selectbox("Kies team", list(team_options.keys()))
-    team_id = team_options[team_name]
 
     sessions_df = get_sessions(team_id)
     players_df = get_players(team_id)
@@ -1024,7 +1122,7 @@ def page_attendance():
     session_label = st.selectbox("Kies sessie", list(session_map.keys()))
     session_id = session_map[session_label]
 
-    existing_df = get_attendance_for_session(session_id)
+    existing_df = get_attendance_for_session(session_id, team_id)
 
     base_df = players_df[["id", "name", "role"]].copy()
     base_df["status"] = "aanwezig"
@@ -1045,10 +1143,7 @@ def page_attendance():
         base_df["reason"] = base_df["reason_saved"].fillna(base_df["reason"])
         base_df["note"] = base_df["note_saved"].fillna(base_df["note"])
 
-        base_df = base_df.drop(
-            columns=["player_id", "status_saved", "reason_saved", "note_saved"],
-            errors="ignore"
-        )
+        base_df = base_df.drop(columns=["player_id", "status_saved", "reason_saved", "note_saved"], errors="ignore")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -1116,7 +1211,7 @@ def page_attendance():
 
     st.divider()
 
-    current_df = get_attendance_for_session(session_id)
+    current_df = get_attendance_for_session(session_id, team_id)
     st.subheader("Huidige opgeslagen aanwezigheid")
 
     if current_df.empty:
@@ -1129,17 +1224,8 @@ def page_attendance():
         st.dataframe(show_df, use_container_width=True, hide_index=True)
 
 
-def page_player_overview():
+def page_player_overview(team_id: int):
     st.title("📊 Spelersoverzicht & analyse")
-
-    teams = get_teams()
-    if teams.empty:
-        st.info("Voeg eerst een team toe.")
-        return
-
-    team_options = {row["name"]: int(row["id"]) for _, row in teams.iterrows()}
-    team_name = st.selectbox("Kies team", list(team_options.keys()))
-    team_id = team_options[team_name]
 
     players_df = get_players(team_id)
     if players_df.empty:
@@ -1229,7 +1315,7 @@ def page_player_overview():
         for s in build_player_signals(team_id, player_id, selected_player_name):
             st.write(f"- {s}")
 
-        history_df = get_player_history(player_id)
+        history_df = get_player_history(player_id, team_id)
         if history_df.empty:
             st.info("Nog geen historie.")
         else:
@@ -1240,17 +1326,8 @@ def page_player_overview():
             st.dataframe(show_history, use_container_width=True, hide_index=True)
 
 
-def page_staff_view():
+def page_staff_view(team_id: int, team_name: str):
     st.title("🔗 Staf / deelweergave")
-
-    teams = get_teams()
-    if teams.empty:
-        st.info("Voeg eerst een team toe.")
-        return
-
-    team_options = {row["name"]: int(row["id"]) for _, row in teams.iterrows()}
-    team_name = st.selectbox("Kies team", list(team_options.keys()))
-    team_id = team_options[team_name]
 
     st.markdown("**Samenvatting om te delen met staf of teammanager**")
     summary = build_shareable_summary(team_name, team_id)
@@ -1269,12 +1346,12 @@ def page_staff_view():
         return
 
     export_df = export_df[[
-        "team_name", "session_date", "title", "session_type",
+        "session_date", "title", "session_type",
         "player_name", "status", "reason", "note"
     ]].copy()
 
     export_df["status"] = export_df["status"].map(lambda x: STATUS_LABELS.get(x, x))
-    export_df.columns = ["Team", "Datum", "Sessie", "Type", "Speler", "Status", "Reden", "Notitie"]
+    export_df.columns = ["Datum", "Sessie", "Type", "Speler", "Status", "Reden", "Notitie"]
 
     st.markdown("**Volledige export**")
     st.dataframe(export_df, use_container_width=True, hide_index=True)
@@ -1287,44 +1364,106 @@ def page_staff_view():
         mime="text/csv",
     )
 
-    st.info(
-        "Zodra je deze app op Streamlit Cloud zet, kun je de link delen met staf of teammanager. "
-        "Iedereen met de link kan dan meekijken. Voor echte privé-accounts en logins is later een volgende versie nodig."
-    )
+
+def page_account(team_id: int):
+    st.title("🔐 Account beheren")
+
+    st.subheader("Wachtwoord wijzigen")
+    with st.form("change_password_form"):
+        new_password = st.text_input("Nieuw wachtwoord", type="password")
+        repeat_password = st.text_input("Herhaal nieuw wachtwoord", type="password")
+        submitted = st.form_submit_button("Wachtwoord opslaan")
+
+        if submitted:
+            if not new_password.strip():
+                st.error("Vul een nieuw wachtwoord in.")
+            elif len(new_password) < 6:
+                st.error("Kies een wachtwoord van minimaal 6 tekens.")
+            elif new_password != repeat_password:
+                st.error("De wachtwoorden zijn niet gelijk.")
+            else:
+                update_current_user_password(st.session_state["user_id"], new_password)
+                st.success("Wachtwoord bijgewerkt.")
+
+    st.divider()
+
+    st.subheader("Extra gebruiker voor dit team toevoegen")
+    with st.form("extra_user_form"):
+        full_name = st.text_input("Naam nieuwe gebruiker")
+        username = st.text_input("Gebruikersnaam nieuwe gebruiker")
+        password = st.text_input("Wachtwoord nieuwe gebruiker", type="password")
+        submitted_user = st.form_submit_button("Gebruiker toevoegen")
+
+        if submitted_user:
+            if not full_name.strip() or not username.strip() or not password.strip():
+                st.error("Vul alle velden in.")
+            elif len(password) < 6:
+                st.error("Kies een wachtwoord van minimaal 6 tekens.")
+            else:
+                try:
+                    create_extra_user_for_team(team_id, full_name, username, password)
+                    st.success("Gebruiker toegevoegd aan dit team.")
+                except sqlite3.IntegrityError:
+                    st.error("Deze gebruikersnaam bestaat al.")
 
 
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
     init_db()
     migrate_old_statuses()
 
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+
+    if count_users() == 0:
+        page_first_setup()
+        return
+
+    if not require_login():
+        page_login()
+        return
+
+    team_id = st.session_state["team_id"]
+    team_name = st.session_state["team_name"]
+    full_name = st.session_state["full_name"]
+
     st.sidebar.title("Navigatie")
+    st.sidebar.markdown(f"**Ingelogd als:** {full_name}")
+    st.sidebar.markdown(f"**Team:** {team_name}")
+
+    if st.sidebar.button("Uitloggen", use_container_width=True):
+        logout()
+        st.rerun()
+
     page = st.sidebar.radio(
         "Ga naar",
         [
             "Dashboard",
-            "Teams beheren",
             "Spelers beheren",
             "Sessies",
             "Aanwezigheid",
             "Spelersoverzicht",
             "Staf / deelweergave",
+            "Account beheren",
         ]
     )
 
     if page == "Dashboard":
-        page_dashboard()
-    elif page == "Teams beheren":
-        page_manage_teams()
+        page_dashboard(team_id, team_name)
     elif page == "Spelers beheren":
-        page_manage_players()
+        page_manage_players(team_id)
     elif page == "Sessies":
-        page_sessions()
+        page_sessions(team_id)
     elif page == "Aanwezigheid":
-        page_attendance()
+        page_attendance(team_id)
     elif page == "Spelersoverzicht":
-        page_player_overview()
+        page_player_overview(team_id)
     elif page == "Staf / deelweergave":
-        page_staff_view()
+        page_staff_view(team_id, team_name)
+    elif page == "Account beheren":
+        page_account(team_id)
 
 
 if __name__ == "__main__":
