@@ -1,5 +1,4 @@
 import hashlib
-import os
 import secrets
 import sqlite3
 from contextlib import closing
@@ -343,6 +342,22 @@ def update_current_user_password(user_id: int, new_password: str):
     )
 
 
+def update_team_user_password(team_id: int, user_id: int, new_password: str):
+    run_query(
+        "UPDATE users SET password_hash = ? WHERE id = ? AND team_id = ?",
+        (hash_password(new_password), user_id, team_id)
+    )
+
+
+def get_team_users(team_id: int) -> pd.DataFrame:
+    return run_query_df("""
+        SELECT id, full_name, username, created_at
+        FROM users
+        WHERE team_id = ?
+        ORDER BY full_name
+    """, (team_id,))
+
+
 def login(username: str, password: str) -> bool:
     user = get_user_by_username(username)
     if not user:
@@ -373,10 +388,6 @@ def require_login():
 # -----------------------------
 # DATA
 # -----------------------------
-def get_team(team_id: int) -> pd.DataFrame:
-    return run_query_df("SELECT * FROM teams WHERE id = ?", (team_id,))
-
-
 def get_players(team_id: int, active_only: bool = True) -> pd.DataFrame:
     query = """
         SELECT p.id, p.name, p.jersey_number, p.role, p.team_id, p.active
@@ -399,8 +410,25 @@ def add_player(name: str, jersey_number: str, role: str, team_id: int):
     """, (name.strip(), jersey_number.strip(), role.strip(), team_id))
 
 
+def update_player(player_id: int, team_id: int, name: str, jersey_number: str, role: str):
+    run_query("""
+        UPDATE players
+        SET name = ?, jersey_number = ?, role = ?
+        WHERE id = ? AND team_id = ?
+    """, (name.strip(), jersey_number.strip(), role.strip(), player_id, team_id))
+
+
 def deactivate_player(player_id: int, team_id: int):
     run_query("UPDATE players SET active = 0 WHERE id = ? AND team_id = ?", (player_id, team_id))
+
+
+def delete_player(player_id: int, team_id: int):
+    player_df = run_query_df("SELECT id FROM players WHERE id = ? AND team_id = ?", (player_id, team_id))
+    if player_df.empty:
+        return
+
+    run_query("DELETE FROM attendance WHERE player_id = ?", (player_id,))
+    run_query("DELETE FROM players WHERE id = ? AND team_id = ?", (player_id, team_id))
 
 
 def get_sessions(team_id: int) -> pd.DataFrame:
@@ -976,22 +1004,72 @@ def page_dashboard(team_id: int, team_name: str):
 def page_manage_players(team_id: int):
     st.title("🏃 Spelers beheren")
 
-    with st.form("player_form"):
-        name = st.text_input("Naam speler")
-        jersey_number = st.text_input("Rugnummer")
-        role = st.selectbox("Rol", ["Veldspeler", "Keeper", "Coach", "Anders"])
-        submitted = st.form_submit_button("Speler toevoegen")
+    tab1, tab2 = st.tabs(["Speler toevoegen", "Speler bewerken"])
 
-        if submitted:
-            if not name.strip():
-                st.error("Vul een naam in.")
-            else:
-                add_player(name, jersey_number, role, team_id)
-                st.success("Speler toegevoegd.")
-                st.rerun()
+    with tab1:
+        with st.form("player_form"):
+            name = st.text_input("Naam speler")
+            jersey_number = st.text_input("Rugnummer")
+            role = st.selectbox("Rol", ["Veldspeler", "Keeper", "Coach", "Anders"])
+            submitted = st.form_submit_button("Speler toevoegen")
+
+            if submitted:
+                if not name.strip():
+                    st.error("Vul een naam in.")
+                else:
+                    add_player(name, jersey_number, role, team_id)
+                    st.success("Speler toegevoegd.")
+                    st.rerun()
+
+    with tab2:
+        players_df = get_players(team_id, active_only=True)
+        if players_df.empty:
+            st.info("Nog geen actieve spelers om te bewerken.")
+        else:
+            player_map = {
+                f"{row['name']} ({row['role']})": int(row["id"])
+                for _, row in players_df.iterrows()
+            }
+            selected_label = st.selectbox("Kies speler", list(player_map.keys()))
+            selected_id = player_map[selected_label]
+            current = players_df[players_df["id"] == selected_id].iloc[0]
+
+            with st.form("edit_player_form"):
+                new_name = st.text_input("Naam", value=current["name"])
+                new_jersey = st.text_input("Rugnummer", value=current["jersey_number"] if pd.notna(current["jersey_number"]) else "")
+                role_options = ["Veldspeler", "Keeper", "Coach", "Anders"]
+                default_role_index = role_options.index(current["role"]) if current["role"] in role_options else 0
+                new_role = st.selectbox("Rol", role_options, index=default_role_index)
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    save = st.form_submit_button("Speler opslaan", use_container_width=True)
+                with c2:
+                    deactivate = st.form_submit_button("Speler deactiveren", use_container_width=True)
+                with c3:
+                    delete = st.form_submit_button("Speler verwijderen", use_container_width=True)
+
+                if save:
+                    if not new_name.strip():
+                        st.error("Vul een naam in.")
+                    else:
+                        update_player(selected_id, team_id, new_name, new_jersey, new_role)
+                        st.success("Speler bijgewerkt.")
+                        st.rerun()
+
+                if deactivate:
+                    deactivate_player(selected_id, team_id)
+                    st.success("Speler gedeactiveerd.")
+                    st.rerun()
+
+                if delete:
+                    delete_player(selected_id, team_id)
+                    st.success("Speler verwijderd.")
+                    st.rerun()
 
     st.divider()
 
+    st.subheader("Actieve spelers")
     players_df = get_players(team_id, active_only=True)
     if players_df.empty:
         st.info("Nog geen spelers.")
@@ -999,14 +1077,6 @@ def page_manage_players(team_id: int):
         show_df = players_df[["name", "jersey_number", "role"]].copy()
         show_df.columns = ["Naam", "Rugnummer", "Rol"]
         st.dataframe(show_df, use_container_width=True, hide_index=True)
-
-        player_map = {f"{row['name']} ({row['role']})": int(row["id"]) for _, row in players_df.iterrows()}
-        if player_map:
-            selected = st.selectbox("Speler deactiveren", list(player_map.keys()))
-            if st.button("Deactiveer speler"):
-                deactivate_player(player_map[selected], team_id)
-                st.success("Speler gedeactiveerd.")
-                st.rerun()
 
 
 def page_sessions(team_id: int):
@@ -1142,7 +1212,6 @@ def page_attendance(team_id: int):
         base_df["status"] = base_df["status_saved"].fillna(base_df["status"])
         base_df["reason"] = base_df["reason_saved"].fillna(base_df["reason"])
         base_df["note"] = base_df["note_saved"].fillna(base_df["note"])
-
         base_df = base_df.drop(columns=["player_id", "status_saved", "reason_saved", "note_saved"], errors="ignore")
 
     c1, c2, c3 = st.columns(3)
@@ -1368,7 +1437,7 @@ def page_staff_view(team_id: int, team_name: str):
 def page_account(team_id: int):
     st.title("🔐 Account beheren")
 
-    st.subheader("Wachtwoord wijzigen")
+    st.subheader("Mijn wachtwoord wijzigen")
     with st.form("change_password_form"):
         new_password = st.text_input("Nieuw wachtwoord", type="password")
         repeat_password = st.text_input("Herhaal nieuw wachtwoord", type="password")
@@ -1403,8 +1472,43 @@ def page_account(team_id: int):
                 try:
                     create_extra_user_for_team(team_id, full_name, username, password)
                     st.success("Gebruiker toegevoegd aan dit team.")
+                    st.rerun()
                 except sqlite3.IntegrityError:
                     st.error("Deze gebruikersnaam bestaat al.")
+
+    st.divider()
+
+    st.subheader("Teamgebruikers")
+    users_df = get_team_users(team_id)
+    if users_df.empty:
+        st.info("Nog geen gebruikers.")
+    else:
+        show_users = users_df.copy()
+        show_users.columns = ["ID", "Naam", "Gebruikersnaam", "Aangemaakt op"]
+        st.dataframe(show_users, use_container_width=True, hide_index=True)
+
+        user_map = {
+            f"{row['full_name']} ({row['username']})": int(row["id"])
+            for _, row in users_df.iterrows()
+        }
+        selected_user_label = st.selectbox("Kies gebruiker voor reset", list(user_map.keys()))
+        selected_user_id = user_map[selected_user_label]
+
+        with st.form("reset_password_form"):
+            reset_password = st.text_input("Nieuw wachtwoord voor gekozen gebruiker", type="password")
+            reset_password_repeat = st.text_input("Herhaal nieuw wachtwoord", type="password")
+            submitted_reset = st.form_submit_button("Wachtwoord resetten")
+
+            if submitted_reset:
+                if not reset_password.strip():
+                    st.error("Vul een wachtwoord in.")
+                elif len(reset_password) < 6:
+                    st.error("Kies een wachtwoord van minimaal 6 tekens.")
+                elif reset_password != reset_password_repeat:
+                    st.error("De wachtwoorden zijn niet gelijk.")
+                else:
+                    update_team_user_password(team_id, selected_user_id, reset_password)
+                    st.success("Wachtwoord van gebruiker bijgewerkt.")
 
 
 # -----------------------------
