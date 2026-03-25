@@ -1,3 +1,4 @@
+
 import hashlib
 import secrets
 import sqlite3
@@ -234,13 +235,6 @@ def verify_password(password: str, stored_hash: str) -> bool:
         return secrets.compare_digest(new_hash, hashed_hex)
     except Exception:
         return False
-
-
-def count_users() -> int:
-    with closing(get_connection()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users")
-        return int(cur.fetchone()[0])
 
 
 def fmt_date(d: str) -> str:
@@ -828,41 +822,8 @@ def build_shareable_summary(team_name: str, team_id: int) -> str:
 
 
 # -----------------------------
-# PAGINA'S LOGIN
+# LOGIN PAGINA'S
 # -----------------------------
-def page_first_setup():
-    st.title("🔐 Eerste keer instellen")
-    st.markdown("<div class='login-box'>", unsafe_allow_html=True)
-    st.write("Maak hieronder het eerste teamaccount aan.")
-
-    with st.form("first_setup_form"):
-        team_name = st.text_input("Teamnaam", placeholder="Bijv. O16-1")
-        age_group = st.text_input("Leeftijdsgroep", placeholder="Bijv. O16")
-        season = st.text_input("Seizoen", placeholder="Bijv. 2025-2026")
-        full_name = st.text_input("Jouw naam", placeholder="Bijv. Pepijn")
-        username = st.text_input("Gebruikersnaam", placeholder="Bijv. o16coach")
-        password = st.text_input("Wachtwoord", type="password")
-        password_repeat = st.text_input("Herhaal wachtwoord", type="password")
-        submitted = st.form_submit_button("Account aanmaken")
-
-        if submitted:
-            if not team_name.strip() or not full_name.strip() or not username.strip() or not password.strip():
-                st.error("Vul alle verplichte velden in.")
-            elif password != password_repeat:
-                st.error("De wachtwoorden zijn niet gelijk.")
-            elif len(password) < 6:
-                st.error("Kies een wachtwoord van minimaal 6 tekens.")
-            else:
-                try:
-                    create_team_and_user(team_name, age_group, season, full_name, username, password)
-                    st.success("Teamaccount aangemaakt. Log nu in.")
-                    st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("Deze teamnaam of gebruikersnaam bestaat al.")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
 def page_login():
     st.title("🏑 Inloggen")
     st.markdown("<div class='login-box'>", unsafe_allow_html=True)
@@ -882,8 +843,47 @@ def page_login():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def page_register():
+    st.title("➕ Nieuw team registreren")
+    st.markdown("<div class='login-box'>", unsafe_allow_html=True)
+
+    with st.form("register_form"):
+        team_name = st.text_input("Teamnaam (uniek)")
+        age_group = st.text_input("Leeftijdsgroep")
+        season = st.text_input("Seizoen")
+        full_name = st.text_input("Jouw naam")
+        username = st.text_input("Gebruikersnaam")
+        password = st.text_input("Wachtwoord", type="password")
+        password_repeat = st.text_input("Herhaal wachtwoord", type="password")
+
+        submitted = st.form_submit_button("Team registreren")
+
+        if submitted:
+            if not team_name.strip() or not username.strip() or not password.strip() or not full_name.strip():
+                st.error("Vul alle verplichte velden in.")
+            elif password != password_repeat:
+                st.error("Wachtwoorden komen niet overeen.")
+            elif len(password) < 6:
+                st.error("Kies een wachtwoord van minimaal 6 tekens.")
+            else:
+                try:
+                    create_team_and_user(
+                        team_name,
+                        age_group,
+                        season,
+                        full_name,
+                        username,
+                        password
+                    )
+                    st.success("Team succesvol aangemaakt. Je kunt nu inloggen.")
+                except sqlite3.IntegrityError:
+                    st.error("Teamnaam of gebruikersnaam bestaat al.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 # -----------------------------
-# PAGINA'S APP
+# APP PAGINA'S
 # -----------------------------
 def page_dashboard(team_id: int, team_name: str):
     st.title(f"🏑 Dashboard — {team_name}")
@@ -1521,12 +1521,15 @@ def main():
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
 
-    if count_users() == 0:
-        page_first_setup()
-        return
-
     if not require_login():
-        page_login()
+        tab1, tab2 = st.tabs(["Inloggen", "Registreren"])
+
+        with tab1:
+            page_login()
+
+        with tab2:
+            page_register()
+
         return
 
     team_id = st.session_state["team_id"]
